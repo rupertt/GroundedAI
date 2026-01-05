@@ -1,6 +1,6 @@
 # GroundedAI
 
-GroundedAI is a minimal local **Python 3.11** RAG web app that answers questions using **OpenAI + LangChain** with **grounded citations** to the documentation you provide.
+GroundedAI is a minimal **Python 3.11** RAG web app that answers questions using **OpenAI + LangChain** with **grounded citations** to the documentation you provide.
 
 ## What it does
 
@@ -116,3 +116,4 @@ Some WSL distros ship an older SQLite library. This project includes `pysqlite3-
 ```bash
 pip install -U -r requirements.txt
 ```
+

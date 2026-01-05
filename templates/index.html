@@ -47,6 +47,50 @@
         </div>
       </section>
 
+      <section class="card">
+        <h2 class="h2">Add Documentation</h2>
+
+        <div class="row">
+          <div class="field">
+            <label class="label" for="uploadFile">Upload file (.pdf / .docx / .txt)</label>
+            <input id="uploadFile" type="file" accept=".pdf,.docx,.txt" />
+          </div>
+          <div class="field actions">
+            <button id="uploadBtn" class="btn" type="button">Upload</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label class="label" for="urlInput">Add URL (single page)</label>
+            <input id="urlInput" type="text" placeholder="https://example.com/docs/page" />
+          </div>
+          <div class="field actions">
+            <button id="urlBtn" class="btn" type="button">Add URL</button>
+          </div>
+        </div>
+
+        <div class="row actions">
+          <button id="refreshDocsBtn" class="btn" type="button">Refresh docs list</button>
+          <button id="reindexBtn" class="btn" type="button">Reindex changed docs</button>
+          <span id="ingestStatus" class="status subtle" aria-live="polite"></span>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <h3 class="h3">Docs</h3>
+            <ul id="docsList" class="list"></ul>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <h3 class="h3">Job status</h3>
+            <div id="jobStatus" class="job"></div>
+          </div>
+        </div>
+      </section>
+
       <section id="result" class="card hidden">
         <h2 class="h2">Answer</h2>
         <pre id="answer" class="answer"></pre>

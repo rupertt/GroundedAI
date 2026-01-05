@@ -5,6 +5,8 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone
+from threading import RLock
 
 # ---- Chroma requires sqlite3 >= 3.35.0 on Linux/WSL.
 # If the Python stdlib sqlite3 module is linked against an older libsqlite3,
@@ -40,6 +42,11 @@ from app.prompts import load_prompt
 logger = logging.getLogger(__name__)
 
 DOC_SOURCE = "doc.txt"
+
+# ---- Indexing coordination
+# Background indexing can run concurrently with requests in FastAPI. We keep it simple and
+# guard Chroma writes + manifest updates with a process-local lock (single-process server).
+_INDEX_LOCK = RLock()
 
 
 def _project_root() -> Path:
@@ -79,7 +86,10 @@ def _supported_raw_files() -> list[Path]:
     for p in raw.iterdir():
         if not p.is_file():
             continue
-        if p.suffix.lower() in {".txt", ".md"}:
+        # Supported ingest/index formats (uploads + URL saves):
+        # - .txt/.md: direct
+        # - .pdf/.docx: extracted during indexing
+        if p.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}:
             files.append(p)
     return sorted(files, key=lambda x: x.name.lower())
 
@@ -100,6 +110,54 @@ def _index_sources() -> list[Path]:
 
 def _index_dir() -> Path:
     return _data_dir() / "index"
+
+
+def _manifest_path() -> Path:
+    """
+    Per-source incremental indexing manifest.
+
+    This tracks the file hash + chunking params so we can skip re-indexing unchanged docs.
+    """
+    return _index_dir() / "manifest.json"
+
+
+def _read_manifest() -> dict[str, Any]:
+    """
+    Read the manifest (or return an empty structure if missing/corrupt).
+
+    Shape:
+    {
+      "version": 1,
+      "sources": {
+        "<filename>": { ... entry ... }
+      }
+    }
+    """
+    path = _manifest_path()
+    if not path.exists():
+        return {"version": 1, "sources": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"version": 1, "sources": {}}
+        if "sources" not in data or not isinstance(data.get("sources"), dict):
+            data["sources"] = {}
+        data.setdefault("version", 1)
+        return data
+    except Exception:
+        logger.exception("Failed to read manifest; continuing with empty manifest (will re-index as needed).")
+        return {"version": 1, "sources": {}}
+
+
+def _write_manifest(data: dict[str, Any]) -> None:
+    """
+    Persist the manifest to disk.
+
+    Notes:
+    - This file lives under ./data/index and is intentionally *not* committed.
+    """
+    _index_dir().mkdir(parents=True, exist_ok=True)
+    _manifest_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _fingerprint_path() -> Path:
@@ -149,6 +207,57 @@ def _read_fingerprint() -> dict[str, Any] | None:
 
 def _write_fingerprint(fp: dict[str, Any]) -> None:
     _fingerprint_path().write_text(json.dumps(fp, indent=2), encoding="utf-8")
+
+
+def _sha256_bytes(b: bytes) -> str:
+    """
+    Compute a sha256 hex digest for raw bytes.
+    """
+    return hashlib.sha256(b).hexdigest()
+
+
+def _now_iso() -> str:
+    """
+    UTC timestamp used for manifest/job bookkeeping.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _extract_text_from_file(path: Path) -> str:
+    """
+    Extract UTF-8 text from supported document types.
+
+    Supported:
+    - .txt/.md: read as utf-8 (errors='ignore' to avoid crashing on odd encodings)
+    - .pdf: use pypdf text extraction per page
+    - .docx: use python-docx paragraph text
+    """
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".md"}:
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+    if suffix == ".pdf":
+        # pypdf extraction can be imperfect, but it's lightweight and good enough for RAG.
+        from pypdf import PdfReader  # type: ignore[import-not-found]
+
+        reader = PdfReader(str(path))
+        parts: list[str] = []
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                # Keep going even if one page fails.
+                parts.append("")
+        return "\n\n".join(p for p in parts if p).strip()
+
+    if suffix == ".docx":
+        from docx import Document as DocxDocument  # type: ignore[import-not-found]
+
+        doc = DocxDocument(str(path))
+        parts = [p.text for p in doc.paragraphs if (p.text or "").strip()]
+        return "\n".join(parts).strip()
+
+    raise ValueError(f"Unsupported file type for indexing: {path.name}")
 
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
@@ -244,14 +353,16 @@ def chunk_doc(text: str, *, source: str) -> list[Document]:
         for chunk in chunks:
             chunk_id = f"chunk-{chunk_index:02d}"
             chunk_index += 1
+            # IMPORTANT: Chroma metadata values must be scalar (str/int/float/bool) and not None.
+            # To satisfy the "section is null when unavailable" requirement, we omit the key entirely
+            # when there is no section title. Consumers should treat missing as null.
+            metadata: dict[str, Any] = {"source": source, "chunk_id": chunk_id}
+            if section_title:
+                metadata["section"] = section_title
             docs.append(
                 Document(
                     page_content=chunk,
-                    metadata={
-                        "source": source,
-                        "chunk_id": chunk_id,
-                        "section": section_title or "",
-                    },
+                    metadata=metadata,
                 )
             )
     return docs
@@ -281,54 +392,149 @@ def get_vectorstore() -> Chroma:
 
 def index_if_needed() -> None:
     """
-    Create or refresh the persistent Chroma index.
+    Ensure the persistent Chroma index exists and is up to date.
 
-    Because we persist under ./data/index, we also persist a small fingerprint file so
-    we can detect when doc.txt (or chunking/embedding settings) changed and rebuild the index.
+    Behavior (incremental, best-practice):
+    - Load the persisted vector store under ./data/index
+    - Load the persisted manifest under ./data/index/manifest.json
+    - For each source file:
+      - If file hash + chunking params unchanged: skip
+      - Else: delete old chunks for that source and re-index only that file
+    - If a previously-indexed source file was removed: delete its chunks and remove it from the manifest
+
+    Notes:
+    - We intentionally do NOT full-rebuild on startup or per request.
+    - We keep the legacy doc_fingerprint.json helpers around (older versions), but the manifest is authoritative.
     """
-    vs = get_vectorstore()
-    try:
-        count = vs._collection.count()  # noqa: SLF001 (Chroma wrapper doesn't expose count)
-    except Exception:  # pragma: no cover
-        logger.exception("Failed to check Chroma collection count; re-indexing to be safe.")
-        count = 0
+    index_scan_incremental()
 
-    current_fp = _compute_fingerprint()
-    stored_fp = _read_fingerprint()
 
-    # If we have vectors and the fingerprint matches, do nothing.
-    if count and count > 0 and stored_fp == current_fp:
-        return
+def index_path_incremental(
+    path: Path,
+    *,
+    source_type: str,
+    _vs: Chroma | None = None,
+    _manifest: dict[str, Any] | None = None,
+    write_manifest: bool = True,
+) -> dict[str, Any]:
+    """
+    Incrementally index a single source file into the persisted Chroma collection.
 
-    # Build docs for all sources (single-doc legacy or multi-doc mode).
-    docs: list[Document] = []
-    ids: list[str] = []
-    for src_path in _index_sources():
-        text = src_path.read_text(encoding="utf-8")
-        src_docs = chunk_doc(text, source=src_path.name)
-        docs.extend(src_docs)
-        # Chroma IDs must be unique across ALL docs; chunk_id alone collides in multi-doc mode.
-        ids.extend([f"{src_path.name}::{d.metadata['chunk_id']}" for d in src_docs])
+    Returns a small dict with {status, skipped, filename, num_chunks}.
 
-    # If vectors exist but doc/settings changed, clear them before re-adding.
-    if count and count > 0:
-        logger.info("Doc/settings changed (or fingerprint missing); rebuilding index.")
+    Requirements:
+    - If file hash and chunk params unchanged: skip
+    - If changed: delete old chunks for that source and re-index only that file
+    """
+    with _INDEX_LOCK:
+        vs = _vs or get_vectorstore()
+        manifest = _manifest or _read_manifest()
+        # Ensure sources dict exists.
+        sources: dict[str, Any] = manifest.setdefault("sources", {})
+
+        st = path.stat()
+        filename = path.name
+        chunk_size = int(settings.chunk_size)
+        chunk_overlap = int(settings.chunk_overlap)
+
+        existing = sources.get(filename) or {}
+        # Cheap short-circuit: if mtime+size and chunk params match, trust it and skip hashing.
+        if (
+            existing
+            and float(existing.get("last_modified", -1)) == float(st.st_mtime)
+            and int(existing.get("size_bytes", -1)) == int(st.st_size)
+            and int(existing.get("chunk_size", -1)) == chunk_size
+            and int(existing.get("chunk_overlap", -1)) == chunk_overlap
+        ):
+            return {"status": "ok", "skipped": True, "filename": filename, "num_chunks": int(existing.get("num_chunks", 0))}
+
+        raw_bytes = path.read_bytes()
+        content_hash = _sha256_bytes(raw_bytes)
+
+        # If content hash and chunk params match, skip (but update mtime/size for correctness).
+        if (
+            existing
+            and str(existing.get("content_hash", "")) == content_hash
+            and int(existing.get("chunk_size", -1)) == chunk_size
+            and int(existing.get("chunk_overlap", -1)) == chunk_overlap
+        ):
+            existing["last_modified"] = float(st.st_mtime)
+            existing["size_bytes"] = int(st.st_size)
+            existing["indexed_at"] = existing.get("indexed_at") or _now_iso()
+            sources[filename] = existing
+            if write_manifest:
+                _write_manifest(manifest)
+            return {"status": "ok", "skipped": True, "filename": filename, "num_chunks": int(existing.get("num_chunks", 0))}
+
+        # Delete old chunks for this source (if any), then re-index.
         try:
-            # Delete all records in the collection.
-            vs._collection.delete(where={})  # noqa: SLF001
+            vs._collection.delete(where={"source": filename})  # noqa: SLF001
         except Exception:
-            logger.exception("Failed to clear existing Chroma collection; continuing (may duplicate).")
+            logger.exception("Failed deleting prior chunks for source=%s; continuing (may duplicate).", filename)
 
-    vs.add_documents(docs, ids=ids)
-    # Persistence happens automatically for persistent_directory, but calling persist is harmless
-    try:
-        vs.persist()
-    except Exception:
-        # Some versions deprecate persist() on wrapper; ignore if not available.
-        pass
+        text = _extract_text_from_file(path)
+        docs = chunk_doc(text, source=filename)
+        ids = [f"{filename}::{d.metadata['chunk_id']}" for d in docs]
+        vs.add_documents(docs, ids=ids)
+        try:
+            vs.persist()
+        except Exception:
+            pass
 
-    # Save fingerprint so we can detect doc changes next time.
-    _write_fingerprint(current_fp)
+        sources[filename] = {
+            "filename": filename,
+            "source_type": str(source_type),
+            "last_modified": float(st.st_mtime),
+            "size_bytes": int(st.st_size),
+            "content_hash": content_hash,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "num_chunks": len(docs),
+            "indexed_at": _now_iso(),
+        }
+        if write_manifest:
+            _write_manifest(manifest)
+        return {"status": "ok", "skipped": False, "filename": filename, "num_chunks": len(docs)}
+
+
+def index_scan_incremental() -> dict[str, Any]:
+    """
+    Incrementally scan expected sources and index only those missing/changed.
+
+    This is safe to call on startup and on each request; unchanged docs are skipped.
+    """
+    with _INDEX_LOCK:
+        _index_dir().mkdir(parents=True, exist_ok=True)
+        vs = get_vectorstore()
+        manifest = _read_manifest()
+        sources: dict[str, Any] = manifest.setdefault("sources", {})
+
+        desired = {p.name: p for p in _index_sources()}
+
+        # Remove entries whose files no longer exist.
+        removed = [name for name in list(sources.keys()) if name not in desired]
+        for name in removed:
+            try:
+                vs._collection.delete(where={"source": name})  # noqa: SLF001
+            except Exception:
+                logger.exception("Failed deleting chunks for removed source=%s; continuing.", name)
+            sources.pop(name, None)
+
+        # Index/update current sources.
+        updated: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        for name, p in desired.items():
+            # Preserve known source_type from manifest where available.
+            existing = sources.get(name) or {}
+            source_type = str(existing.get("source_type") or ("url" if name.startswith("url_") else "upload"))
+            res = index_path_incremental(p, source_type=source_type, _vs=vs, _manifest=manifest, write_manifest=False)
+            if res.get("skipped"):
+                skipped.append(name)
+            else:
+                updated.append(res)
+
+        _write_manifest(manifest)
+        return {"status": "ok", "updated": updated, "skipped": skipped, "removed": removed}
 
 
 def get_retriever(top_k: int) -> Any:
@@ -377,7 +583,8 @@ def _select_diverse(
     per_group: dict[tuple[str, str], int] = {}
     for d, s in deduped:
         src = str(d.metadata.get("source", DOC_SOURCE))
-        sec = str(d.metadata.get("section", ""))[:120]
+        # section may be None; treat as empty for grouping.
+        sec = str(d.metadata.get("section") or "")[:120]
         group = (src, sec)
         if per_group.get(group, 0) >= 2 and len(per_group) > 1:
             continue

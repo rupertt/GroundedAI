@@ -13,6 +13,9 @@ venv/
 data/index/*
 !data/index/.gitkeep
 
+data/raw/*
+!data/raw/.gitkeep
+
 # Logs
 *.log
 

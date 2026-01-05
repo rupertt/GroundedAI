@@ -7,19 +7,30 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.logging import setup_logging
 from app.core.types import AskRequest, AskResponse
+from app.ingest import router as ingest_router
 from app.rag import answer_question
 from app.web import router as ui_router
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="rag-citations-app")
+# NOTE: We reserve GET /docs for listing ingested documents (per project requirements).
+# Move Swagger UI off /docs to avoid a route conflict.
+app = FastAPI(
+    title="rag-citations-app",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+)
 
 # Serve local static assets for the browser UI (no external CDNs).
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Minimal UI at GET / (kept separate from API routes).
 app.include_router(ui_router)
+
+# Ingestion + docs/jobs endpoints (kept separate from /ask schemas).
+app.include_router(ingest_router)
 
 
 @app.get("/health")

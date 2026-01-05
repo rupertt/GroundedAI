@@ -6,7 +6,7 @@ Minimal local **Python 3.11** RAG web app that answers questions using **OpenAI 
 
 - **Indexes docs** into local persistent **Chroma** at `./data/index` (SQLite-backed).
   - Default: `./data/doc.txt` (single-doc mode)
-  - Optional: `./data/raw/*.txt|*.md` (multi-doc mode)
+  - Optional: `./data/raw/*` (multi-doc mode; supports `.txt`, `.md`, `.pdf`, `.docx`)
 - **Chunks deterministically** with stable IDs: `chunk-00`, `chunk-01`, …
   - Hierarchical splitting by section headers where possible, then recursive splitting
   - Stores metadata: `source` (filename) and `section`
@@ -113,11 +113,52 @@ In the web UI (`/`), enable the **Agent mode** toggle to call `/ask_agent`.
 
 ## Adding new documents (multi-document mode)
 
-Put one or more `.txt` or `.md` files into `./data/raw/`.
+You can add documentation in two ways:
 
-- The app will automatically re-index on next request.
-- Citations will reference the correct file: `[<filename>#chunk-XX]`.
-- If `./data/raw/` does not exist (default), the app uses `./data/doc.txt` and citations remain `[doc.txt#chunk-XX]`.
+### 1) Upload a file (background indexed)
+
+- `POST /ingest/upload` (multipart/form-data field name: `file`)
+- Allowed extensions: `.pdf`, `.docx`, `.txt`
+- Saved as-is into `./data/raw/<safe_filename>`
+- Returns quickly with a `job_id` and indexes in the background.
+
+Example curl:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/ingest/upload \
+  -F "file=@./some_doc.pdf"
+```
+
+### 2) Add a URL (single page only; background indexed)
+
+- `POST /ingest/url` with JSON: `{"url":"https://..."}`
+- Fetches ONLY the provided URL (no crawling), extracts main text, saves it as a `.txt` under `./data/raw/`, then indexes in the background.
+
+Example curl:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/ingest/url \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/docs/page"}'
+```
+
+### Job status
+
+- `GET /jobs/{job_id}` returns: `job_id`, `status`, `progress`, `error`, `created_at`, `finished_at`
+
+### List docs
+
+- `GET /docs` returns files present in `./data/raw` with `filename`, `size_bytes`, `modified_at`
+
+### Reindex changed docs (optional)
+
+- `POST /index` triggers an incremental scan in the background and returns a `job_id`
+
+### Index persistence + incremental behavior
+
+- The vector store is persisted under `./data/index`.
+- Incremental state is tracked in `./data/index/manifest.json`.
+- The app avoids full rebuilds: it deletes/reindexes only the files that changed (or were removed).
 
 ## Evals (measurable quality)
 

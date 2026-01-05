@@ -12,6 +12,14 @@ function setLoading(isLoading) {
   status.textContent = isLoading ? "Asking..." : "";
 }
 
+function setIngestStatus(text) {
+  el("ingestStatus").textContent = text || "";
+}
+
+function setJobStatus(text) {
+  el("jobStatus").textContent = text || "";
+}
+
 function showResult() {
   el("result").classList.remove("hidden");
 }
@@ -30,7 +38,8 @@ function renderCitations(citations) {
   for (const c of citations || []) {
     const li = document.createElement("li");
     const title = document.createElement("div");
-    title.textContent = `${c.chunk_id}`;
+    // Include filename for multi-doc readability.
+    title.textContent = `${c.source}#${c.chunk_id}`;
 
     const snippet = document.createElement("div");
     snippet.className = "snippet";
@@ -98,6 +107,111 @@ async function ask() {
   }
 }
 
+async function fetchJson(url, options) {
+  const resp = await fetch(url, options || {});
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    data = null;
+  }
+  if (!resp.ok) {
+    let detail = data?.detail;
+    if (detail && typeof detail !== "string") {
+      try {
+        detail = JSON.stringify(detail);
+      } catch (e) {
+        detail = String(detail);
+      }
+    }
+    const msg = detail || `Request failed with status ${resp.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function refreshDocs() {
+  const docs = await fetchJson("/docs");
+  const ul = el("docsList");
+  ul.innerHTML = "";
+  for (const d of docs || []) {
+    const li = document.createElement("li");
+    li.textContent = `${d.filename} (${d.size_bytes} bytes)`;
+    ul.appendChild(li);
+  }
+  if (!docs || docs.length === 0) {
+    const li = document.createElement("li");
+    li.className = "subtle";
+    li.textContent = "No docs found in ./data/raw yet.";
+    ul.appendChild(li);
+  }
+}
+
+async function pollJob(jobId) {
+  setJobStatus(`Job ${jobId}: queued...`);
+  while (true) {
+    const job = await fetchJson(`/jobs/${jobId}`);
+    const status = job.status || "unknown";
+    const progress = job.progress ?? 0;
+    const err = job.error;
+    setJobStatus(
+      `Job ${jobId}\nstatus: ${status}\nprogress: ${progress}%` +
+        (err ? `\nerror: ${err}` : "")
+    );
+    if (status === "succeeded" || status === "failed") {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+}
+
+async function uploadDoc() {
+  const fileInput = el("uploadFile");
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) {
+    setIngestStatus("Please choose a file to upload.");
+    return;
+  }
+
+  setIngestStatus("Uploading...");
+  setJobStatus("");
+  const form = new FormData();
+  form.append("file", file);
+  const data = await fetchJson("/ingest/upload", { method: "POST", body: form });
+  setIngestStatus(`Saved as ${data.saved_as}. Indexing in background...`);
+  await pollJob(data.job_id);
+  await refreshDocs();
+  setIngestStatus("Done.");
+}
+
+async function addUrl() {
+  const url = el("urlInput").value.trim();
+  if (!url) {
+    setIngestStatus("Please enter a URL.");
+    return;
+  }
+  setIngestStatus("Fetching URL and extracting text...");
+  setJobStatus("");
+  const data = await fetchJson("/ingest/url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  setIngestStatus(`Saved as ${data.saved_as}. Indexing in background...`);
+  await pollJob(data.job_id);
+  await refreshDocs();
+  setIngestStatus("Done.");
+}
+
+async function reindexChanged() {
+  setIngestStatus("Starting incremental reindex...");
+  setJobStatus("");
+  const data = await fetchJson("/index", { method: "POST" });
+  await pollJob(data.job_id);
+  await refreshDocs();
+  setIngestStatus("Done.");
+}
+
 function wireEvents() {
   el("askBtn").addEventListener("click", ask);
   el("question").addEventListener("keydown", (e) => {
@@ -106,8 +220,34 @@ function wireEvents() {
       ask();
     }
   });
+
+  el("uploadBtn").addEventListener("click", () => {
+    uploadDoc().catch((err) => {
+      setIngestStatus(`Error: ${err.message || String(err)}`);
+    });
+  });
+
+  el("urlBtn").addEventListener("click", () => {
+    addUrl().catch((err) => {
+      setIngestStatus(`Error: ${err.message || String(err)}`);
+    });
+  });
+
+  el("refreshDocsBtn").addEventListener("click", () => {
+    refreshDocs().catch((err) => {
+      setIngestStatus(`Error: ${err.message || String(err)}`);
+    });
+  });
+
+  el("reindexBtn").addEventListener("click", () => {
+    reindexChanged().catch((err) => {
+      setIngestStatus(`Error: ${err.message || String(err)}`);
+    });
+  });
 }
 
 wireEvents();
+// Load docs list on initial page load.
+refreshDocs().catch(() => {});
 
 

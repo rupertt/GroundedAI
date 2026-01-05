@@ -182,7 +182,8 @@ def _fetch_url_html(url: str, *, timeout_s: float, max_bytes: int) -> _FetchedPa
     if host and _is_private_ip(host):
         raise HTTPException(status_code=400, detail="Blocked host.")
 
-    headers = {"User-Agent": "rag-citations-app/1.0 (+single-page ingestion)"}
+    # Use a stable, explicit UA so upstreams can identify traffic from this app.
+    headers = {"User-Agent": "GroundedAI/1.0 (+single-page ingestion)"}
     with httpx.Client(follow_redirects=True, timeout=timeout_s, headers=headers) as client:
         resp = client.get(url)
         resp.raise_for_status()

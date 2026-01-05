@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 # NOTE: We reserve GET /docs for listing ingested documents (per project requirements).
 # Move Swagger UI off /docs to avoid a route conflict.
 app = FastAPI(
-    title="rag-citations-app",
+    # Public-facing name used in OpenAPI metadata.
+    title="GroundedAI",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
